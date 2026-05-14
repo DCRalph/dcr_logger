@@ -1,0 +1,20 @@
+{
+  "name": "dcr_logger",
+  "version": "1.0.0",
+  "description": "ESP32 Arduino logging and console utilities.",
+  "keywords": "esp32, arduino, logger, console",
+  "frameworks": "arduino",
+  "platforms": ["espressif32"],
+  "authors": {
+    "name": "William Giles",
+    "email": "me@williamgiles.co.nz",
+    "url": "https://github.com/DCRalph"
+  },
+  "dependencies": {},
+  "build": {
+    "srcDir": ".",
+    "includeDir": ".",
+    "unflags": ["-std=gnu++11", "-std=gnu++14"],
+    "flags": ["-std=gnu++17"]
+  }
+}
