@@ -19,6 +19,8 @@ extern int hereCounter;
     esp_backtrace_print(10);                                              \
   } while (0)
 
+
+
 enum class LogLevel : uint8_t
 {
   Fatal = 0,
@@ -43,7 +45,7 @@ public:
   static bool IsEnabled(LogLevel level);
 
   static void Logs(LogLevel level, const char *tag, const char *message);
-  static void Logf(LogLevel level, const char *tag, const char *fmt, ...); // logf stands for log format
+  static void Logf(LogLevel level, const char *tag, const char *fmt, ...);          // logf stands for log format
   static void Logv(LogLevel level, const char *tag, const char *fmt, va_list args); // logv stands for log variable
 
   static void InstallLogHook();

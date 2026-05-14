@@ -1,6 +1,6 @@
-#include "Console.h"
+#include "dcr_Console.h"
 
-#include "LoggerSerialMutex.h"
+#include "dcr_LoggerSerialMutex.h"
 
 #include <cstdlib>
 #include <cstring>

@@ -1,4 +1,4 @@
-#include "Logger.h"
+#include "dcr_Logger.h"
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -7,8 +7,8 @@
 #include <cstring>
 #include <mutex>
 
-#include "Console.h"
-#include "LoggerSerialMutex.h"
+#include "dcr_Console.h"
+#include "dcr_LoggerSerialMutex.h"
 
 namespace
 {
