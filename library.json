@@ -1,6 +1,6 @@
 {
   "name": "dcr_logger",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "ESP32 Arduino logging and console utilities.",
   "keywords": "esp32, arduino, logger, console",
   "frameworks": "arduino",
