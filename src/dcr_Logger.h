@@ -1,12 +1,21 @@
 #pragma once
 
 #include <Arduino.h>
+#include <FS.h>
 #include <cstdarg>
 #include <functional>
 #include <string>
 #include <vector>
 
 #include "esp_debug_helpers.h"
+
+#ifndef DCR_LOGGER_CACHE_PSRAM_BYTES
+#define DCR_LOGGER_CACHE_PSRAM_BYTES (2 * 1024 * 1024)
+#endif
+
+#ifndef DCR_LOGGER_CACHE_NO_PSRAM_BYTES
+#define DCR_LOGGER_CACHE_NO_PSRAM_BYTES (128 * 1024)
+#endif
 
 extern int hereCounter;
 
@@ -54,6 +63,17 @@ public:
   // file). Pass nullptr / empty std::function to unregister.
   static void SetSecondarySink(SecondarySink sink);
 
+  // In-memory ring buffer capacity (bytes). Grows to the PSRAM size when PSRAM
+  // is available at runtime.
+  static size_t GetCacheCapacityBytes();
+
+  // Number of bytes currently retained in the ring buffer.
+  static size_t GetCachedLogBytes();
+
+  // Write the retained ring-buffer contents to a filesystem path (e.g.
+  // "/log.txt"). Returns true when all cached bytes were written.
+  static bool WriteCacheToFile(fs::FS &filesystem, const char *path);
+
 private:
   static LogLevel _level;
 };
@@ -81,6 +101,8 @@ namespace LoggerInternal
   void LogText(LogLevel level, const char *tag, const char *message);
   char *GetLogCache();
   size_t GetCachedLogSize();
+  size_t GetCacheCapacity();
+  bool WriteCacheToFile(fs::FS &filesystem, const char *path);
   std::vector<String> GetLatestLogs();
 
   template <typename... Args>

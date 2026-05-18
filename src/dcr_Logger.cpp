@@ -12,11 +12,10 @@
 
 namespace
 {
-  constexpr size_t LOG_CACHE_MAX_SIZE_WITH_PSRAM = 1024 * 1024;
-  constexpr size_t LOG_CACHE_MAX_SIZE_NO_PSRAM = 128 * 1024;
+  constexpr size_t LOG_CACHE_MAX_SIZE_WITH_PSRAM = DCR_LOGGER_CACHE_PSRAM_BYTES;
+  constexpr size_t LOG_CACHE_MAX_SIZE_NO_PSRAM = DCR_LOGGER_CACHE_NO_PSRAM_BYTES;
   constexpr size_t MAX_LATEST_LOGS = 20;
   bool gInitialized = false;
-  bool gSaveToFile = false;
   bool gSecondarySinkEnabled = false;
   bool gLastSecondarySinkState = false;
   char *gLogCache = nullptr;
@@ -309,6 +308,21 @@ void Logger::SetSecondarySink(SecondarySink sink)
   gSecondarySink = std::move(sink);
 }
 
+size_t Logger::GetCacheCapacityBytes()
+{
+  return LoggerInternal::GetCacheCapacity();
+}
+
+size_t Logger::GetCachedLogBytes()
+{
+  return LoggerInternal::GetCachedLogSize();
+}
+
+bool Logger::WriteCacheToFile(fs::FS &filesystem, const char *path)
+{
+  return LoggerInternal::WriteCacheToFile(filesystem, path);
+}
+
 void LoggerInternal::Raw(const char *message)
 {
   dispatchRaw(message);
@@ -334,6 +348,31 @@ size_t LoggerInternal::GetCachedLogSize()
 {
   ensureInitialized();
   return gCachedLogSize;
+}
+
+size_t LoggerInternal::GetCacheCapacity()
+{
+  ensureInitialized();
+  return gCacheLogMaxSize;
+}
+
+bool LoggerInternal::WriteCacheToFile(fs::FS &filesystem, const char *path)
+{
+  if (path == nullptr || path[0] == '\0')
+    return false;
+
+  ensureInitialized();
+  std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
+  if (gLogCache == nullptr || gCachedLogSize == 0)
+    return false;
+
+  File file = filesystem.open(path, FILE_WRITE);
+  if (!file)
+    return false;
+
+  const size_t written = file.write(reinterpret_cast<const uint8_t *>(gLogCache), gCachedLogSize);
+  file.close();
+  return written == gCachedLogSize;
 }
 
 std::vector<String> LoggerInternal::GetLatestLogs()
