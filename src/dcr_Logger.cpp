@@ -4,6 +4,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 
@@ -21,8 +22,26 @@ namespace
   char *gLogCache = nullptr;
   size_t gCacheLogMaxSize = 0;
   size_t gCachedLogSize = 0;
+  // Cumulative bytes ever appended to the cache. The cache always holds the
+  // stream range [gStreamTotal - gCachedLogSize, gStreamTotal); this lets the
+  // incremental file sync find "bytes since last sync" even after evictions.
+  // Guarded by serialMutex like the cache itself.
+  uint64_t gStreamTotal = 0;
+  // Stream position already written to the sync file (see SyncCacheToFile).
+  uint64_t gSyncedStreamPos = 0;
   std::vector<String> gLatestLogs;
   Logger::SecondarySink gSecondarySink;
+
+  // Serializes WriteCacheToFile/SyncCacheToFile file sessions now that they
+  // no longer hold serialMutex across the flash write (two tasks interleaving
+  // writes on the same path would tear the file). Lock order: fileSyncMutex
+  // first, serialMutex (briefly) inside — never the reverse while holding a
+  // file session.
+  std::mutex &fileSyncMutex()
+  {
+    static std::mutex m;
+    return m;
+  }
 
   char levelLetter(LogLevel level)
   {
@@ -154,7 +173,26 @@ namespace
 
     size_t discardCount = 0;
     if (cachedSize + bytesToAppend > cacheCapacity)
+    {
       discardCount = (cachedSize + bytesToAppend) - cacheCapacity;
+
+      // Evict in large chunks. Discarding only the exact overflow meant that
+      // once the cache filled, EVERY append shifted the entire buffer with a
+      // multi-MB memmove — on whichever task logged, while holding
+      // serialMutex. Dropping a chunk at a time amortizes that shift across
+      // hundreds of appends.
+      const size_t discardChunk = std::min<size_t>(64 * 1024, cacheCapacity / 8);
+      if (discardCount < discardChunk)
+        discardCount = discardChunk;
+      if (discardCount > cachedSize)
+        discardCount = cachedSize;
+
+      // Extend the cut to the next line boundary (bounded scan) so the
+      // retained cache still starts on a whole log line.
+      const size_t scanLimit = std::min(cachedSize, discardCount + 256);
+      while (discardCount < scanLimit && cache[discardCount - 1] != '\n')
+        ++discardCount;
+    }
 
     if (discardCount >= cachedSize)
     {
@@ -176,6 +214,7 @@ namespace
       cachedSize = cacheCapacity;
 
     cache[cachedSize] = '\0';
+    gStreamTotal += bytesToAppend;
   }
 
   void appendLatestLog(const String &message)
@@ -323,6 +362,11 @@ bool Logger::WriteCacheToFile(fs::FS &filesystem, const char *path)
   return LoggerInternal::WriteCacheToFile(filesystem, path);
 }
 
+bool Logger::SyncCacheToFile(fs::FS &filesystem, const char *path, size_t maxFileBytes)
+{
+  return LoggerInternal::SyncCacheToFile(filesystem, path, maxFileBytes);
+}
+
 void LoggerInternal::Raw(const char *message)
 {
   dispatchRaw(message);
@@ -362,17 +406,182 @@ bool LoggerInternal::WriteCacheToFile(fs::FS &filesystem, const char *path)
     return false;
 
   ensureInitialized();
-  std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
-  if (gLogCache == nullptr || gCachedLogSize == 0)
-    return false;
+
+  // Snapshot the cache under the mutex, then write the file with the mutex
+  // released. serialMutex is shared with every log call in the system;
+  // holding it across a multi-second flash write blocked all logging tasks
+  // (and flash writes additionally suspend the flash/PSRAM cache), which
+  // showed up as UI stalls. The snapshot memcpy is bounded and fast.
+  char *snapshot = nullptr;
+  size_t snapshotSize = 0;
+  uint64_t snapshotStreamEnd = 0;
+  {
+    std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
+    if (gLogCache == nullptr || gCachedLogSize == 0)
+      return false;
+    snapshot = static_cast<char *>(ps_malloc(gCachedLogSize));
+    if (snapshot != nullptr)
+    {
+      snapshotSize = gCachedLogSize;
+      memcpy(snapshot, gLogCache, snapshotSize);
+      snapshotStreamEnd = gStreamTotal;
+    }
+  }
+
+  std::lock_guard<std::mutex> fileLock(fileSyncMutex());
+
+  if (snapshot == nullptr)
+  {
+    // No PSRAM headroom for a snapshot: fall back to writing under the mutex
+    // (previous behavior) rather than dropping the flush entirely.
+    std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
+    if (gLogCache == nullptr || gCachedLogSize == 0)
+      return false;
+    File file = filesystem.open(path, FILE_WRITE);
+    if (!file)
+      return false;
+    const size_t written = file.write(reinterpret_cast<const uint8_t *>(gLogCache), gCachedLogSize);
+    file.close();
+    if (written != gCachedLogSize)
+      return false;
+    gSyncedStreamPos = gStreamTotal;
+    return true;
+  }
 
   File file = filesystem.open(path, FILE_WRITE);
   if (!file)
+  {
+    free(snapshot);
+    return false;
+  }
+  const size_t written = file.write(reinterpret_cast<const uint8_t *>(snapshot), snapshotSize);
+  file.close();
+  free(snapshot);
+
+  if (written != snapshotSize)
     return false;
 
-  const size_t written = file.write(reinterpret_cast<const uint8_t *>(gLogCache), gCachedLogSize);
-  file.close();
-  return written == gCachedLogSize;
+  {
+    // The file now equals the cache as of the snapshot; record that so the
+    // next incremental sync doesn't re-append the same bytes.
+    std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
+    if (snapshotStreamEnd > gSyncedStreamPos)
+      gSyncedStreamPos = snapshotStreamEnd;
+  }
+  return true;
+}
+
+bool LoggerInternal::SyncCacheToFile(fs::FS &filesystem, const char *path, size_t maxFileBytes)
+{
+  if (path == nullptr || path[0] == '\0' || maxFileBytes == 0)
+    return false;
+
+  ensureInitialized();
+
+  // Chunk staging buffer, allocated once. Each chunk is copied out of the
+  // cache under serialMutex (bounded memcpy) and written to flash with the
+  // mutex released, so log calls on other tasks never block behind flash I/O.
+  static uint8_t *chunkBuf = nullptr;
+  static size_t chunkBufSize = 0;
+  {
+    std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
+    if (chunkBuf == nullptr)
+    {
+      chunkBufSize = 16 * 1024;
+      chunkBuf = static_cast<uint8_t *>(ps_malloc(chunkBufSize));
+      if (chunkBuf == nullptr)
+      {
+        chunkBufSize = 4 * 1024;
+        chunkBuf = static_cast<uint8_t *>(malloc(chunkBufSize));
+      }
+      if (chunkBuf == nullptr)
+      {
+        chunkBufSize = 0;
+        return false;
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> fileLock(fileSyncMutex());
+
+  uint64_t droppedBytes = 0;
+  size_t totalWritten = 0;
+  File file;
+
+  // Cap one sync pass at a full cache's worth of data so a task logging
+  // faster than flash can drain cannot pin us in this loop; the remainder
+  // goes out on the next sync.
+  const size_t maxBytesPerSync = gCacheLogMaxSize;
+
+  while (totalWritten < maxBytesPerSync)
+  {
+    size_t chunkLen = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
+      if (gLogCache == nullptr)
+        break;
+
+      const uint64_t streamBase = gStreamTotal - gCachedLogSize;
+      if (gSyncedStreamPos < streamBase)
+      {
+        // Bytes were evicted from the cache before we could sync them.
+        droppedBytes += streamBase - gSyncedStreamPos;
+        gSyncedStreamPos = streamBase;
+      }
+
+      const uint64_t avail = gStreamTotal - gSyncedStreamPos;
+      if (avail == 0)
+        break;
+
+      chunkLen = static_cast<size_t>(std::min<uint64_t>(avail, chunkBufSize));
+      const size_t offset = static_cast<size_t>(gSyncedStreamPos - streamBase);
+      memcpy(chunkBuf, gLogCache + offset, chunkLen);
+    }
+
+    if (!file)
+    {
+      file = filesystem.open(path, FILE_APPEND);
+      if (!file)
+        return false;
+    }
+
+    // Rotation: cap the on-disk file. Restarting with the newest data keeps
+    // the steady-state flash cost proportional to new log volume instead of
+    // rewriting the whole cache every interval. WriteCacheToFile still
+    // produces a complete cache image when one is needed (e.g. for upload).
+    if (file.size() + chunkLen > maxFileBytes)
+    {
+      file.close();
+      file = filesystem.open(path, FILE_WRITE);
+      if (!file)
+        return false;
+    }
+
+    if (droppedBytes > 0)
+    {
+      const String marker =
+          "[LOGGER] " + String(static_cast<unsigned long>(droppedBytes)) + " bytes dropped before sync\n";
+      file.write(reinterpret_cast<const uint8_t *>(marker.c_str()), marker.length());
+      droppedBytes = 0;
+    }
+
+    const size_t written = file.write(chunkBuf, chunkLen);
+    if (written != chunkLen)
+    {
+      file.close();
+      return false;
+    }
+    totalWritten += chunkLen;
+
+    {
+      std::lock_guard<std::recursive_mutex> lock(LoggerInternal::serialMutex());
+      gSyncedStreamPos += chunkLen;
+    }
+  }
+
+  if (file)
+    file.close();
+  return true;
 }
 
 std::vector<String> LoggerInternal::GetLatestLogs()

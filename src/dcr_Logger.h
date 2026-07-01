@@ -71,8 +71,21 @@ public:
   static size_t GetCachedLogBytes();
 
   // Write the retained ring-buffer contents to a filesystem path (e.g.
-  // "/log.txt"). Returns true when all cached bytes were written.
+  // "/log.txt"). Returns true when all cached bytes were written. The cache is
+  // snapshotted under the logging mutex and the file is written with the mutex
+  // released, so concurrent log calls are not blocked behind flash I/O. A
+  // successful full write also counts as "synced" for SyncCacheToFile.
   static bool WriteCacheToFile(fs::FS &filesystem, const char *path);
+
+  // Incrementally append bytes logged since the last sync to a filesystem
+  // path. Unlike WriteCacheToFile this only writes NEW bytes, so the steady-
+  // state flash cost is proportional to log volume rather than cache size.
+  // When the file would exceed maxFileBytes it is truncated and restarted with
+  // the newest data. Bytes that were evicted from the ring buffer before they
+  // could be synced are recorded in the file as a "[LOGGER] N bytes dropped"
+  // marker. Not safe to call concurrently with itself or WriteCacheToFile on
+  // the same path (callers are expected to sync from a single task).
+  static bool SyncCacheToFile(fs::FS &filesystem, const char *path, size_t maxFileBytes);
 
 private:
   static LogLevel _level;
@@ -103,6 +116,7 @@ namespace LoggerInternal
   size_t GetCachedLogSize();
   size_t GetCacheCapacity();
   bool WriteCacheToFile(fs::FS &filesystem, const char *path);
+  bool SyncCacheToFile(fs::FS &filesystem, const char *path, size_t maxFileBytes);
   std::vector<String> GetLatestLogs();
 
   template <typename... Args>
