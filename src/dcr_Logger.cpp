@@ -32,11 +32,6 @@ namespace
   std::vector<String> gLatestLogs;
   Logger::SecondarySink gSecondarySink;
 
-  // Serializes WriteCacheToFile/SyncCacheToFile file sessions now that they
-  // no longer hold serialMutex across the flash write (two tasks interleaving
-  // writes on the same path would tear the file). Lock order: fileSyncMutex
-  // first, serialMutex (briefly) inside — never the reverse while holding a
-  // file session.
   std::mutex &fileSyncMutex()
   {
     static std::mutex m;
@@ -545,10 +540,6 @@ bool LoggerInternal::SyncCacheToFile(fs::FS &filesystem, const char *path, size_
         return false;
     }
 
-    // Rotation: cap the on-disk file. Restarting with the newest data keeps
-    // the steady-state flash cost proportional to new log volume instead of
-    // rewriting the whole cache every interval. WriteCacheToFile still
-    // produces a complete cache image when one is needed (e.g. for upload).
     if (file.size() + chunkLen > maxFileBytes)
     {
       file.close();
